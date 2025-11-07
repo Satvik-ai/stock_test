@@ -1,0 +1,5 @@
+[core]
+    remote = myremote
+['remote "myremote"']
+    url = gs://iitmbs-mlops-21f1000344
+    credentialpath = ../iitmbs-mlops-a99d6ce657ac.json

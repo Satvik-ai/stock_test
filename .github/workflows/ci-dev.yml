@@ -1,0 +1,231 @@
+name: CI - Dev Branch
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dev-ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure DVC Remote
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GCP_KEY_JSON }}
+        run: |
+          echo "${GOOGLE_APPLICATION_CREDENTIALS}" > gcp-key.json
+          dvc remote modify myremote credentialpath gcp-key.json
+        
+      - name: Setup GCP credentials
+        run: |
+          echo "${{ secrets.GCP_KEY_BASE64 }}" | base64 --decode > gcp-key.json
+          echo "GCP key file written to gcp-key.json"
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: gcp-key.json
+
+      - name: Pull data from DVC
+        run: dvc pull -r myremote
+
+      - name: Fetch best model from MLflow
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_EXPERIMENT_NAME: ${{ secrets.MLFLOW_EXPERIMENT_NAME }}
+        run: |
+          echo "Fetching best model from MLflow experiment..."
+          python <<'PYCODE'
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          import os, shutil
+
+          client = MlflowClient()
+          experiment_name = os.getenv("MLFLOW_EXPERIMENT_NAME")
+          experiment = client.get_experiment_by_name(experiment_name)
+          if not experiment:
+              raise SystemExit(f"Experiment '{experiment_name}' not found in MLflow.")
+          
+          experiment_id = experiment.experiment_id
+          print(f"Searching best model from experiment: {experiment_name} (ID: {experiment_id})")
+
+          results = mlflow.search_logged_models(
+              experiment_ids=[experiment_id],
+              order_by=[{"field_name": "metrics.accuracy", "ascending": False}],
+              max_results=1,
+              output_format="list"
+          )
+
+          if not results:
+              raise SystemExit("No logged models found in this experiment.")
+
+          best_model = results[0]
+          print(f"Best model ID: {best_model.model_id}")
+          print(f"Accuracy: {best_model.metrics[0].value}")
+
+          model_uri = f"models:/{best_model.model_id}"
+          output_dir = "fetched_model"
+          if os.path.exists(output_dir):
+              shutil.rmtree(output_dir)
+
+          os.makedirs(output_dir, exist_ok=True)
+          mlflow.artifacts.download_artifacts(artifact_uri=model_uri, dst_path=output_dir)
+          print(f"Saved best model locally at '{output_dir}/'")
+          PYCODE
+
+      - name: Model sanity check & accuracy evaluation
+        run: |
+          python <<'PYCODE'
+          import mlflow.pyfunc
+          import pandas as pd
+          from sklearn.model_selection import train_test_split
+          from sklearn.metrics import accuracy_score, classification_report
+
+          model = mlflow.pyfunc.load_model("fetched_model")
+          df = pd.read_parquet("data/stock_data.parquet")
+
+          X = df[['open', 'high', 'low', 'close', 'volume', 'ma_15_min', 'ma_60_min', 'rsi_14']]
+          y = df["target"]
+          X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+          y_pred = model.predict(X_test)
+          acc = accuracy_score(y_test, y_pred)
+          report = classification_report(y_test, y_pred, output_dict=False)
+
+          print(f"Test Accuracy: {acc:.4f}")
+          print(report)
+
+          with open("accuracy_report.md", "w") as f:
+              f.write("## Model Evaluation Report\n\n")
+              f.write(f"**Test Accuracy:** {acc:.4f}\n\n")
+              f.write("```text\n")
+              f.write("### Classification Report\n\n")
+              f.write(report)
+              f.write("\n```\n\n")
+          PYCODE
+
+      - name: Run unit tests and generate Markdown report
+        run: |
+          pytest --maxfail=1 --disable-warnings --tb=short -q --junitxml=report.xml > pytest_output.txt
+
+          echo "## Dev Branch Pytest Summary Report" > dev_report.md
+          echo "" >> dev_report.md
+          echo "**Date:** $(date)" >> dev_report.md
+          echo "" >> dev_report.md
+          echo "### Test Results:" >> dev_report.md
+          echo '```' >> dev_report.md
+          cat pytest_output.txt >> dev_report.md
+          echo '```' >> dev_report.md
+          echo "" >> dev_report.md
+          pytest --maxfail=1 --disable-warnings --tb=short -q --cov=. --cov-report=term-missing >> pytest_output.txt 2>&1 || true
+
+      - name: Sample Prediction (Feast Online Store)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: gcp-key.json
+        run: |
+          python <<'PYCODE'
+          from feast import FeatureStore
+          import pandas as pd
+          import mlflow.pyfunc
+
+          # Load Feature Store
+          store = FeatureStore(repo_path="feature_repo")
+
+          # Detect data version
+          df = pd.read_parquet("data/stock_data.parquet")
+          if "stock_v1_id" in df.columns:
+              version = "v1"
+              id_col = "stock_v1_id"
+          elif "stock_v2_id" in df.columns:
+              version = "v2"
+              id_col = "stock_v2_id"
+          else:
+              raise ValueError("No version column found (expected stock_v1_id or stock_v2_id).")
+
+          print(f"✅ Detected feature view version: {version}")
+
+          # Load model
+          model = mlflow.pyfunc.load_model("fetched_model")
+
+          sample_rows = []
+          sample_ids = df[id_col].unique()[:5]
+          for entity_id in sample_ids:
+              entity_df = pd.DataFrame({id_col: [entity_id]})
+
+              print("\n===============================")
+              print("Requesting online features for entities:", entity_df.to_dict(orient='records'))
+
+              feature_vector = store.get_online_features(
+                  features=[
+                      f"stock_features_{version}:open",
+                      f"stock_features_{version}:high",
+                      f"stock_features_{version}:low",
+                      f"stock_features_{version}:close",
+                      f"stock_features_{version}:volume",
+                      f"stock_features_{version}:ma_15_min",
+                      f"stock_features_{version}:ma_60_min",
+                      f"stock_features_{version}:rsi_14",
+                  ],
+                  entity_rows=entity_df.to_dict(orient="records"),
+              ).to_df()
+
+              print("Online features (raw):")
+              print(feature_vector)
+
+              X = feature_vector.drop(columns=[id_col])
+              pred = model.predict(X)[0]
+
+              # Find true label from df (if available)
+              true_label = df.loc[df[id_col] == entity_id, "target"].values[0] if entity_id in df[id_col].values else "N/A"
+
+              print(f"Predicted target: {pred}, True target: {true_label}")
+              sample_rows.append({"Entity": entity_id, "True": true_label, "Predicted": pred})
+
+          # Append to Markdown report
+          if sample_rows:
+              sample_df = pd.DataFrame(sample_rows)
+              with open("accuracy_report.md", "a") as f:
+                  f.write("### Sample Predictions (Feast Online Store)\n\n")
+                  f.write(sample_df.to_markdown(index=False))
+                  f.write("\n\n")
+          PYCODE
+
+      - name: Set up CML
+        uses: iterative/setup-cml@v2
+        with:
+          version: latest
+          vega: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment CML Report on commit (push)
+        if: github.event_name == 'push'
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat accuracy_report.md >> dev_report.md
+          cml comment create --target=commit --publish dev_report.md
+
+      - name: Comment CML Report on PR (pull request)
+        if: github.event_name == 'pull_request'
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat accuracy_report.md >> dev_report.md
+          cml comment create --target=pr --publish dev_report.md
